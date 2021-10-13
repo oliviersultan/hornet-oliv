@@ -51,6 +51,12 @@ type queueItem struct {
 	Ed25519Address *iotago.Ed25519Address
 }
 
+// pendingTransaction holds info about a sent transaction that is pending.
+type pendingTransaction struct {
+	MessageID   hornet.MessageID
+	QueuedItems []*queueItem
+}
+
 // FaucetInfoResponse defines the response of a GET RouteFaucetInfo REST API call.
 type FaucetInfoResponse struct {
 	// The bech32 address of the faucet.
@@ -98,12 +104,14 @@ type Faucet struct {
 	// events of the faucet.
 	Events *Events
 
-	// the message ID of the last sent faucet message.
-	lastMessageID hornet.MessageID
 	// map with all queued requests per address.
 	queueMap map[string]*queueItem
 	// queue of new requests.
 	queue chan *queueItem
+	// the message ID of the last sent faucet message.
+	lastMessageID hornet.MessageID
+	// pendingTransactions are the sent transactions that are pending.
+	pendingTransactions []*pendingTransaction
 }
 
 // the default options applied to the faucet.
@@ -264,6 +272,7 @@ func (f *Faucet) init() {
 	f.queue = make(chan *queueItem, 5000)
 	f.queueMap = make(map[string]*queueItem)
 	f.lastMessageID = hornet.NullMessageID()
+	f.pendingTransactions = make([]*pendingTransaction, 5000)
 }
 
 // NetworkPrefix returns the used network prefix.
@@ -323,14 +332,25 @@ func (f *Faucet) Enqueue(bech32 string, ed25519Addr *iotago.Ed25519Address) (*Fa
 	}
 }
 
-// clearRequests clears the old requests from the map.
+// clearRequestsWithoutLocking clears the old requests from the map.
 // this is necessary to be able to send new requests to the same addresses.
-func (f *Faucet) clearRequests(batchedRequests []*queueItem) {
-	f.Lock()
-	defer f.Unlock()
-
+// write lock must be acquired outside.
+func (f *Faucet) clearRequestsWithoutLocking(batchedRequests []*queueItem) {
 	for _, request := range batchedRequests {
 		delete(f.queueMap, request.Bech32)
+	}
+}
+
+// readdRequestsWithoutLocking adds old requests back to the queue.
+// write lock must be acquired outside.
+func (f *Faucet) readdRequestsWithoutLocking(batchedRequests []*queueItem) {
+	for _, request := range batchedRequests {
+		select {
+		case f.queue <- request:
+		default:
+			// queue full => no way to readd it, delete it from the map as well so user are able to send a new request
+			delete(f.queueMap, request.Bech32)
+		}
 	}
 }
 
@@ -561,6 +581,74 @@ func (f *Faucet) logSoftError(err error) {
 	f.Events.SoftError.Trigger(err)
 }
 
+func (f *Faucet) collectRequests(ctx context.Context) ([]*queueItem, error) {
+
+	batchedRequests := []*queueItem{}
+	collectedRequestsCounter := 0
+
+CollectValues:
+	for collectedRequestsCounter < f.opts.maxOutputCount-1 {
+		select {
+		case <-ctx.Done():
+			// faucet was stopped
+			return nil, common.ErrOperationAborted
+
+		case <-time.After(f.opts.batchTimeout):
+			// timeout was reached => stop collecting requests
+			break CollectValues
+
+		case request := <-f.queue:
+			batchedRequests = append(batchedRequests, request)
+			collectedRequestsCounter++
+		}
+	}
+
+	return batchedRequests, nil
+}
+
+func (f *Faucet) isLastMessageConflicting() bool {
+	if bytes.Equal(f.lastMessageID, hornet.NullMessageID()) {
+		// no message sent yet
+		return false
+	}
+
+	cachedMsgMeta := f.storage.CachedMessageMetadataOrNil(f.lastMessageID)
+	if cachedMsgMeta == nil {
+		// message unknown
+		return false
+	}
+	defer cachedMsgMeta.Release(true)
+
+	return cachedMsgMeta.Metadata().IsConflictingTx()
+}
+
+func (f *Faucet) processRequests(collectedRequestsCounter int, amount uint64, batchedRequests []*queueItem) []*queueItem {
+
+	processedBatchedRequests := []*queueItem{}
+	unprocessedBatchedRequests := []*queueItem{}
+
+	for i := 0; i < len(batchedRequests); i++ {
+		request := batchedRequests[i]
+
+		if collectedRequestsCounter < f.opts.maxOutputCount-1 && amount > f.opts.amount {
+			// request can be processed in this transaction
+			amount -= request.Amount
+			collectedRequestsCounter++
+			processedBatchedRequests = append(processedBatchedRequests, request)
+		} else {
+			// request can't be processed in this transaction, re-add it to the queue
+			unprocessedBatchedRequests = append(unprocessedBatchedRequests, request)
+		}
+	}
+
+	f.Lock()
+	defer f.Unlock()
+	f.clearRequestsWithoutLocking(processedBatchedRequests)
+	f.readdRequestsWithoutLocking(unprocessedBatchedRequests)
+
+	return processedBatchedRequests
+}
+
 // RunFaucetLoop collects unspent outputs on the faucet address and batches the requests from the queue.
 func (f *Faucet) RunFaucetLoop(ctx context.Context) error {
 
@@ -573,75 +661,94 @@ func (f *Faucet) RunFaucetLoop(ctx context.Context) error {
 			return nil
 
 		default:
+			// first collect requests
+			batchedRequests, err := f.collectRequests(ctx)
+			if err != nil {
+				if err == common.ErrOperationAborted {
+					return nil
+				}
+				return err
+			}
 
-			// only collect unspent outputs if the lastRemainderOutput is not pending
 			shouldCollectUnspentOutputs := func() bool {
 				if lastRemainderOutput == nil {
+					// there is no last remainder output => it is safe to collect all unspent outputs
 					return true
 				}
 
-				if _, err := f.utxoManager.ReadOutputByOutputIDWithoutLocking(lastRemainderOutput.OutputID()); err != nil {
+				// if last message is conflicting => collect unspent outputs
+				// better check all lastMessages, if one of them conflicting => collect
+				// if some confirmed, remove them from list
+				// if one message doesn't get confirmed, latestMessage can get BMD => reattach all in order?
+				// maybe too complicated => better remember the requests per message and reattach?
+
+				// lastRemainderOutput exists, that means that a transaction was sent to the network,
+				// which could be pending.
+				remainderOutput, err := f.utxoManager.ReadOutputByOutputIDWithoutLocking(lastRemainderOutput.OutputID())
+				if err != nil {
+					// output doesn't exist yet in the ledger (still pending) => do not collect unspent outputs
+					// TODO: what happens if never included? or conflicting?
 					return false
 				}
 
-				return true
-			}
+				// the lastRemainderOutput is reused as input in the next transaction, even if it was not yet referenced by a milestone.
+				// this is done to increase the throughput of the faucet in high load situations.
+				// we can't collect unspent outputs, as long as the lastRemainderOutput was not confirmed,
+				// since it's creating transaction could also have consumed the same UTXOs.
 
-			var err error
-			unspentOutputs := []*utxo.Output{}
-			if shouldCollectUnspentOutputs() {
-				unspentOutputs, err = f.utxoManager.UnspentOutputs(utxo.FilterAddress(f.address), utxo.ReadLockLedger(false), utxo.MaxResultCount(f.opts.maxOutputCount-2), utxo.FilterOutputType(iotago.OutputSigLockedSingleOutput))
+				unspent, err := f.utxoManager.IsOutputUnspentWithoutLocking(remainderOutput)
 				if err != nil {
-					return fmt.Errorf("reading unspent outputs failed: %s, error: %w", f.address.Bech32(f.opts.hrpNetworkPrefix), err)
+					// kvstore error => collect unspent outputs
+					return true
 				}
-			} else {
-				unspentOutputs = append(unspentOutputs, lastRemainderOutput)
+
+				// => only collect unspent outputs, if the lastRemainderOutput was spent
+				return !unspent
 			}
 
-			var amount uint64 = 0
-			found := false
-			for _, unspentOutput := range unspentOutputs {
-				amount += unspentOutput.Amount()
-				if lastRemainderOutput != nil && bytes.Equal(unspentOutput.OutputID()[:], lastRemainderOutput.OutputID()[:]) {
-					found = true
+			collectUnspentOutputs := func() ([]*utxo.Output, uint64, error) {
+				f.utxoManager.ReadLockLedger()
+				defer f.utxoManager.ReadUnlockLedger()
+
+				if !shouldCollectUnspentOutputs() {
+					return []*utxo.Output{lastRemainderOutput}, lastRemainderOutput.Amount(), nil
 				}
-			}
 
-			if lastRemainderOutput != nil && !found {
-				unspentOutputs = append(unspentOutputs, lastRemainderOutput)
-				amount += lastRemainderOutput.Amount()
-			}
-
-			collectedRequestsCounter := len(unspentOutputs)
-			batchWriterTimeoutChan := time.After(f.opts.batchTimeout)
-			batchedRequests := []*queueItem{}
-
-		CollectValues:
-			for collectedRequestsCounter < f.opts.maxOutputCount-1 && amount > f.opts.amount {
-				select {
-				case <-ctx.Done():
-					// faucet was stopped
-					return nil
-
-				case <-batchWriterTimeoutChan:
-					// timeout was reached => stop collecting requests
-					break CollectValues
-
-				case request := <-f.queue:
-					batchedRequests = append(batchedRequests, request)
-					collectedRequestsCounter++
-					amount -= request.Amount
+				unspentOutputs, err := f.utxoManager.UnspentOutputs(utxo.FilterAddress(f.address), utxo.ReadLockLedger(false), utxo.MaxResultCount(f.opts.maxOutputCount-2), utxo.FilterOutputType(iotago.OutputSigLockedSingleOutput))
+				if err != nil {
+					return nil, 0, fmt.Errorf("reading unspent outputs failed: %s, error: %w", f.address.Bech32(f.opts.hrpNetworkPrefix), err)
 				}
+
+				var amount uint64 = 0
+				found := false
+				for _, unspentOutput := range unspentOutputs {
+					amount += unspentOutput.Amount()
+					if lastRemainderOutput != nil && bytes.Equal(unspentOutput.OutputID()[:], lastRemainderOutput.OutputID()[:]) {
+						found = true
+					}
+				}
+
+				if lastRemainderOutput != nil && !found {
+					unspentOutputs = append(unspentOutputs, lastRemainderOutput)
+					amount += lastRemainderOutput.Amount()
+				}
+
+				return unspentOutputs, amount, nil
 			}
 
-			f.clearRequests(batchedRequests)
+			unspentOutputs, amount, err := collectUnspentOutputs()
+			if err != nil {
+				return err
+			}
 
 			if len(unspentOutputs) < 2 && len(batchedRequests) == 0 {
 				// no need to sweep or send funds
 				continue
 			}
 
-			remainderOutput, err := f.sendFaucetMessage(ctx, unspentOutputs, batchedRequests)
+			processableRequsts := f.processRequests(len(unspentOutputs), amount, batchedRequests)
+
+			remainderOutput, err := f.sendFaucetMessage(ctx, unspentOutputs, processableRequsts)
 			if err != nil {
 				if common.IsCriticalError(err) != nil {
 					// error is a critical error
